@@ -133,18 +133,99 @@ INSERT INTO LOCACAO (CODDVD,CODCLIENTE,DATA_LOCACAO, DATA_DEVOLUCAO) VALUES(8,2,
 
 
 
--- 1) Crie um trigger que gera um log de todas as alterações na tabela DVD (linha por linha). Para isso crie uma tabela de log
--- com os campos código (serial), comando (INSERT, DELETE ou UPDATE) e descrição (o que ocorreu).
+CREATE OR REPLACE FUNCTION log_dvd() RETURNS trigger AS
+$$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO dvd_log(comando, descricao)
+        VALUES ('INSERT', 'Novo DVD inserido (CODDVD=' || NEW.coddvd || ').');
+        RETURN NEW;
 
+    ELSIF TG_OP = 'DELETE' THEN
+        INSERT INTO dvd_log(comando, descricao)
+        VALUES ('DELETE', 'DVD deletado (CODDVD=' || OLD.codvd || ').');
+        RETURN OLD;
 
+    ELSIF TG_OP = 'UPDATE' THEN
+        INSERT INTO dvd_log(comando, descricao)
+        VALUES (
+            'UPDATE',
+            'DVD atualizado de CODDVD=' || OLD.coddvd || ' para CODDVD=' || NEW.coddvd || '.'
+        );
+        RETURN NEW;
 
+    END IF;
 
+    RETURN NULL;
 
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_log_dvd ON DVD;
+
+CREATE TRIGGER trg_log_dvd
+AFTER INSERT OR DELETE OR UPDATE ON DVD
+FOR EACH ROW
+EXECUTE FUNCTION log_dvd();
 
 -- 2) Faça um trigger que modifica o status de um DVD, baseado em cada um dos eventos:
 -- a. Entrega de um DVD alugado
 -- b. Reserva de um DVD. Considere uma reserva de 4 dias, a contar do dia atual caso o DVD esteja disponível,
 -- caso contrário a reserva não deve ser efetuada.
+-- A) Trigger para entrega do DVD
+CREATE OR REPLACE FUNCTION atualiza_status_entrega() RETURNS TRIGGER AS
+$$
+BEGIN
+    IF NEW.data_devolucao IS NOT NULL THEN
+        UPDATE DVD SET codstatus = (
+            SELECT codstatus FROM status WHERE nome_status = 'disponível'
+        ) WHERE coddvd = NEW.coddvd;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_entrega ON locacao;
+
+CREATE TRIGGER trg_entrega
+AFTER UPDATE ON locacao
+FOR EACH ROW
+WHEN (NEW.data_devolucao IS NOT NULL)
+EXECUTE FUNCTION atualiza_status_entrega();
+
+-- B) Trigger para reserva do DVD
+CREATE OR REPLACE FUNCTION atualiza_status_reserva() RETURNS TRIGGER AS
+$$
+DECLARE
+    status_atual VARCHAR(30);
+BEGIN
+    SELECT nome_status INTO status_atual
+    FROM status s
+    JOIN dvd d ON s.codstatus = d.codstatus
+    WHERE d.coddvd = NEW.coddvd;
+
+    IF status_atual = 'disponível' THEN
+        UPDATE dvd
+        SET codstatus = (SELECT codstatus FROM status WHERE nome_status = 'reservado')
+        WHERE coddvd = NEW.coddvd;
+
+        RETURN NEW;
+
+    ELSE
+        RAISE EXCEPTION 'DVD não disponível para reserva!';
+    END IF;
+
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_reserva ON reserva;
+
+CREATE TRIGGER trg_reserva
+BEFORE INSERT ON reserva
+FOR EACH ROW
+EXECUTE FUNCTION atualiza_status_reserva();
+
+
 
 
 
@@ -157,3 +238,53 @@ INSERT INTO LOCACAO (CODDVD,CODCLIENTE,DATA_LOCACAO, DATA_DEVOLUCAO) VALUES(8,2,
 -- ii. caso não esteja, não permita a realização da operação (gere um erro com a mensagem: “Reserva
 -- para outro cliente!”)
 -- c. Caso esteja locado, não permita a realização da operação e gere um erro com a mensagem: “DVD locado!”
+CREATE OR REPLACE FUNCTION controla_locacao() RETURNS TRIGGER AS
+$$
+DECLARE
+    status_atual VARCHAR(30);
+    cliente_reserva INT;
+BEGIN
+    -- Status atual do DVD
+    SELECT nome_status INTO status_atual
+    FROM status s
+    JOIN dvd d ON s.codstatus = d.codstatus
+    WHERE d.coddvd = NEW.coddvd;
+
+    IF status_atual = 'disponível' THEN
+        UPDATE dvd
+        SET codstatus = (SELECT codstatus FROM status WHERE nome_status = 'locado')
+        WHERE coddvd = NEW.coddvd;
+        RETURN NEW;
+
+    ELSIF status_atual = 'reservado' THEN
+        SELECT codcliente INTO cliente_reserva
+        FROM reserva
+        WHERE coddvd = NEW.coddvd
+        AND data_validade >= CURRENT_DATE
+        ORDER BY data_validade ASC
+        LIMIT 1;
+
+        IF cliente_reserva = NEW.codcliente THEN
+            UPDATE dvd
+            SET codstatus = (SELECT codstatus FROM status WHERE nome_status = 'locado')
+            WHERE coddvd = NEW.coddvd;
+            RETURN NEW;
+        ELSE
+            RAISE EXCEPTION 'Reserva para outro cliente!';
+        END IF;
+
+    ELSIF status_atual = 'locado' THEN
+        RAISE EXCEPTION 'DVD locado!';
+    END IF;
+
+    RETURN NULL;
+
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_locacao ON locacao;
+
+CREATE TRIGGER trg_locacao
+BEFORE INSERT ON locacao
+FOR EACH ROW
+EXECUTE FUNCTION controla_locacao();
